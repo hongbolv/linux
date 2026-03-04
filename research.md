@@ -13,8 +13,9 @@
 9. [Peer 所有权管理机制](#9-peer-所有权管理机制)
 10. [KUnit 测试框架](#10-kunit-测试框架)
 11. [关键代码路径分析](#11-关键代码路径分析)
-12. [配置依赖与编译选项](#12-配置依赖与编译选项)
-13. [总结与设计亮点](#13-总结与设计亮点)
+12. [多 GPU 之间 P2P 数据交换完整流程](#12-多-gpu-之间-p2p-数据交换完整流程)
+13. [配置依赖与编译选项](#13-配置依赖与编译选项)
+14. [总结与设计亮点](#14-总结与设计亮点)
 
 ---
 
@@ -686,9 +687,393 @@ xe_migrate_to_vram() / xe_migrate_from_vram()
 
 ---
 
-## 12. 配置依赖与编译选项
+## 12. 多 GPU 之间 P2P 数据交换完整流程
 
-### 12.1 内核配置
+本节以两个 Intel Xe GPU（GPU-A 和 GPU-B）之间的 P2P 数据交换为例，详细描述从初始化到数据传输完成的端到端流程。
+
+### 12.1 前置条件：设备注册与 P2P 拓扑发现
+
+在任何 P2P 数据交换发生之前，系统必须先完成设备的注册和互联拓扑检测：
+
+```
+系统启动 / 设备探测
+  │
+  ├─ GPU-A 加载 Xe 驱动
+  │    └→ xe_pagemap_create(xe_A, vr_A)
+  │         ├→ drm_pagemap_init()              # 初始化 pagemap
+  │         ├→ xpagemap_A->peer.private = XE_PEER_PAGEMAP
+  │         └→ drm_pagemap_acquire_owner(&xpagemap_A->peer, &xe_owner_list,
+  │                                       xe_has_interconnect)
+  │              └→ 此时 owner list 为空，创建新的 owner 组
+  │
+  └─ GPU-B 加载 Xe 驱动
+       └→ xe_pagemap_create(xe_B, vr_B)
+            ├→ drm_pagemap_init()
+            ├→ xpagemap_B->peer.private = XE_PEER_PAGEMAP
+            └→ drm_pagemap_acquire_owner(&xpagemap_B->peer, &xe_owner_list,
+                                          xe_has_interconnect)
+                 └→ 遍历 owner list 找到 GPU-A 的 peer
+                 └→ 调用 xe_has_interconnect(peer_A, peer_B)
+                      └→ pci_p2pdma_distance(pci_dev_A, dev_B, true)
+                           ├→ ≥ 0：P2P 可达 → 两个 GPU 共享同一 owner
+                           └→ < 0：P2P 不可达 → 创建不同的 owner
+```
+
+**关键结果**：如果两个 GPU 通过 PCIe Switch 直连，`pci_p2pdma_distance()` 返回 ≥ 0，两个 pagemap 将被分配到同一个 `drm_pagemap_owner`。后续的迁移决策可以通过比较 `pagemap->owner` 快速判断 P2P 是否可行，无需再次查询 PCIe 拓扑。
+
+### 12.2 场景一：SVM 页面错误触发的多 GPU 数据迁移
+
+当 GPU-B 访问一块当前位于 GPU-A VRAM 中的数据时，会触发页面错误，引发跨 GPU 的 P2P 数据迁移：
+
+#### 阶段 1：页面错误触发
+
+```
+GPU-B 执行计算任务，访问虚拟地址 VA
+  │
+  └→ 页面错误（VA 对应的数据在 GPU-A 的 VRAM 中）
+       └→ xe_svm_handle_pagefault(vm_B, vma, gt_B, fault_addr, atomic)
+            └→ need_vram = xe_vma_need_vram_for_atomic(xe_B, vma, atomic)
+            └→ __xe_svm_handle_pagefault(vm_B, vma, gt_B, fault_addr, need_vram)
+```
+
+#### 阶段 2：垃圾回收与范围查找
+
+```
+__xe_svm_handle_pagefault()
+  │
+  ├→ xe_svm_garbage_collector(vm)          # 清理已失效的 SVM 范围
+  ├→ dpagemap = xe_vma_resolve_pagemap(vma, tile_B)   # 获取 GPU-B 的目标 pagemap
+  └→ range = xe_svm_range_find_or_insert(vm, fault_addr, vma, &ctx)
+       └→ 查找或创建覆盖 fault_addr 的 SVM 范围
+```
+
+#### 阶段 3：VRAM 分配与数据迁移
+
+```
+__xe_svm_handle_pagefault() 续
+  │
+  ├→ xe_svm_range_needs_migrate_to_vram(range, vma, dpagemap_B)
+  │    └→ 判断数据是否需要迁移到 GPU-B 的 VRAM
+  │
+  └→ xe_svm_alloc_vram(range, &ctx, dpagemap_B)
+       │
+       ├→ drm_gpusvm_scan_mm(&range->base, owner, pagemap_B)
+       │    └→ 扫描当前页面位置，判断是否已在目标设备
+       │    └→ 返回 DRM_GPUSVM_SCAN_EQUAL（已在目标）或需要迁移
+       │
+       └→ drm_pagemap_populate_mm(dpagemap_B, start, end, mm, timeslice_ms)
+            └→ dpagemap_B->ops->populate_mm()
+            └→ xe_drm_pagemap_populate_mm(dpagemap_B, start, end, mm, timeslice_ms)
+```
+
+#### 阶段 4：目标 VRAM 空间准备
+
+```
+xe_drm_pagemap_populate_mm()
+  │
+  ├→ xe_bo_create_locked(xe_B, ..., XE_BO_FLAG_VRAM(vr_B))
+  │    └→ 在 GPU-B 的 VRAM 中分配 BO（Buffer Object）
+  │
+  ├→ drm_pagemap_devmem_init(&bo->devmem_allocation, dev_B, mm,
+  │                           &dpagemap_devmem_ops, dpagemap_B, size,
+  │                           pre_migrate_fence)
+  │    └→ 初始化设备内存分配结构，关联回调函数：
+  │         .copy_to_devmem = xe_svm_copy_to_devmem
+  │         .copy_to_ram = xe_svm_copy_to_ram
+  │         .populate_devmem_pfn = xe_svm_populate_devmem_pfn
+  │
+  └→ drm_pagemap_migrate_to_devmem(&bo->devmem_allocation, mm, start, end,
+                                    &mdetails{.source_peer_migrates = 1})
+```
+
+#### 阶段 5：DRM 框架层迁移编排（核心 P2P 步骤）
+
+```
+drm_pagemap_migrate_to_devmem()     [drivers/gpu/drm/drm_pagemap.c]
+  │
+  ├─ Step 1: migrate_vma_setup(&migrate)
+  │    └→ 内核 VMA 迁移框架锁定源页面
+  │    └→ migrate.src[] 填充源页面 PFN
+  │
+  ├─ Step 2: 检查源页面类型
+  │    for each page in migrate.src[]:
+  │      └→ 如果是 device_private_page（位于 GPU-A 的 VRAM）：
+  │           └→ 标记为需要 P2P 迁移
+  │
+  ├─ Step 3: ops->populate_devmem_pfn()
+  │    └→ xe_svm_populate_devmem_pfn()
+  │         └→ 遍历 GPU-B BO 的 buddy allocator blocks
+  │         └→ 计算每个 VRAM 块的 PFN
+  │         └→ 填充 migrate.dst[] 数组
+  │
+  ├─ Step 4: 确定迁移方向（source_peer_migrates = 1）
+  │    for each page:
+  │      └→ 源页面在 GPU-A（device_private_page）
+  │           └→ source_peer_migrates = 1
+  │           └→ 使用 GPU-A（源端）的 copy_to_ram() 将数据读出
+  │           └→ pages[i] = src_page（GPU-A 页面）
+  │
+  │    *** 这是 P2P 迁移的关键决策 ***
+  │    ┌─────────────────────────────────────────────────┐
+  │    │  source_peer_migrates = 1 时的 P2P 迁移策略：    │
+  │    │                                                  │
+  │    │  GPU-A 的 copy_to_ram() 负责将数据从 GPU-A      │
+  │    │  VRAM 复制到目标 DMA 地址。目标 DMA 地址可以是：  │
+  │    │  • 系统内存地址（DRM_INTERCONNECT_SYSTEM）        │
+  │    │  • GPU-B 的 PCIe 地址（XE_INTERCONNECT_P2P）     │
+  │    │                                                  │
+  │    │  source_peer_migrates = 0 时：                    │
+  │    │  GPU-B 的 copy_to_devmem() 负责将数据写入        │
+  │    │  GPU-B 的 VRAM。                                 │
+  │    └─────────────────────────────────────────────────┘
+  │
+  ├─ Step 5: drm_pagemap_migrate_range() 执行实际数据复制
+  │    └→ 使用 device_map() 将目标页面映射为 DMA 地址
+  │         └→ xe_drm_pagemap_device_map(dpagemap_B, dev_A, dst_page, ...)
+  │              └→ pgmap_dev(GPU-B) != dev(GPU-A)
+  │              └→ addr = dma_map_resource(dev_A, xe_page_to_pcie(dst_page), ...)
+  │              └→ prot = XE_INTERCONNECT_P2P
+  │    └→ 调用 GPU-A 的 copy_to_ram(pages, pagemap_addr, npages, fence)
+  │         └→ xe_svm_copy_to_ram()
+  │              └→ xe_svm_copy(pages, pagemap_addr, npages, XE_SVM_COPY_TO_SRAM, ...)
+  │
+  └─ Step 6: migrate_vma_pages() + migrate_vma_finalize()
+       └→ 完成页表更新，将 VA 映射到 GPU-B 的新页面
+```
+
+#### 阶段 6：GPU 复制引擎执行传输
+
+```
+xe_svm_copy(pages, pagemap_addr, npages, XE_SVM_COPY_TO_SRAM, fence)
+  │
+  ├→ 遍历 pages[] 数组
+  │    └→ 对每个源页面（GPU-A VRAM）：
+  │         └→ vram_addr = xe_page_to_dpa(page)   # 获取 GPU-A 的 DPA 地址
+  │
+  ├→ 检测物理连续性，分组为 ≤8MB 的块
+  │
+  └→ 对每个块调用 GPU-A 的复制引擎：
+       └→ xe_migrate_from_vram(vr_A->migrate, npages,
+                               vram_addr,          # GPU-A VRAM 的 DPA 地址
+                               &pagemap_addr[pos],  # 目标 DMA 地址（P2P: GPU-B PCIe 地址）
+                               pre_migrate_fence)
+
+xe_migrate_from_vram() → xe_migrate_vram()
+  │
+  ├→ build_pt_update_batch_sram()
+  │    └→ 验证 pagemap_addr[i].proto == XE_INTERCONNECT_P2P
+  │    └→ 将 P2P DMA 地址编码为 GPU 页表项（PTE）
+  │
+  └→ GPU-A 的复制引擎通过 PCIe 总线直接写入 GPU-B 的 VRAM
+       ┌────────────┐     PCIe Bus     ┌────────────┐
+       │   GPU-A    │ ================→│   GPU-B    │
+       │            │   P2P DMA 传输    │            │
+       │ VRAM(src)  │                   │ VRAM(dst)  │
+       │ DPA addr   │                   │ PCIe addr  │
+       └────────────┘                   └────────────┘
+```
+
+#### 阶段 7：绑定 GPU 页表并完成
+
+```
+__xe_svm_handle_pagefault() 续
+  │
+  ├→ xe_svm_range_get_pages(vm, range, &ctx)
+  │    └→ 获取迁移后的页面映射
+  │    └→ 对每个页面调用 device_map()
+  │         └→ pgmap_dev(GPU-B) == dev(GPU-B)
+  │         └→ addr = xe_page_to_dpa(page)    # 使用 GPU-B 本地 DPA
+  │         └→ prot = XE_INTERCONNECT_VRAM    # 同设备访问
+  │
+  ├→ xe_vm_range_rebind(vm, vma, range, BIT(tile_B->id))
+  │    └→ 更新 GPU-B 的页表，将 VA 映射到 GPU-B VRAM 中的新数据
+  │
+  └→ dma_fence_wait(fence, false)
+       └→ 等待所有操作完成
+       └→ GPU-B 现在可以以 VRAM 速度访问数据
+```
+
+### 12.3 场景二：DMA-BUF 跨 GPU 缓冲区共享
+
+DMA-BUF 路径是 P2P 的另一种使用场景，通常用于显式的缓冲区共享：
+
+```
+┌─────── GPU-A（导出者）───────┐    ┌─────── GPU-B（导入者）───────┐
+│                              │    │                              │
+│  Step 1: 创建 BO 在 VRAM    │    │                              │
+│    bo = xe_bo_create(VRAM0)  │    │                              │
+│                              │    │                              │
+│  Step 2: 导出 DMA-BUF       │    │                              │
+│    dmabuf = xe_gem_prime_    │    │                              │
+│             export(bo, 0)    │    │                              │
+│    dmabuf->ops = &xe_dmabuf_ │───→│  Step 3: 导入 DMA-BUF       │
+│                  ops         │    │    import = xe_gem_prime_     │
+│                              │    │             import(dmabuf)    │
+│                              │    │                              │
+│                              │    │  Step 4: 动态附着            │
+│                              │    │    dma_buf_dynamic_attach(    │
+│                              │    │      dmabuf, dev_B,           │
+│                              │    │      &xe_dma_buf_attach_ops,  │ ← allow_peer2peer=true
+│                              │    │      &bo->ttm.base)           │
+│                              │    │                              │
+│  Step 5: P2P 检测           │    │                              │
+│    xe_dma_buf_attach()       │    │                              │
+│      pci_p2pdma_distance(    │    │                              │
+│        pci_dev_A, dev_B,     │    │                              │
+│        false)                │    │                              │
+│      → ≥ 0: P2P 可用        │    │                              │
+│        attach->peer2peer =   │    │                              │
+│        true                  │    │                              │
+│                              │    │                              │
+│  Step 6: 映射（保留 VRAM）  │    │                              │
+│    xe_dma_buf_map()          │    │                              │
+│      P2P 可用:               │    │                              │
+│      xe_bo_validate()        │    │                              │
+│      → BO 保留在 GPU-A VRAM │    │                              │
+│      xe_ttm_vram_mgr_        │    │                              │
+│        alloc_sgt(dev_B, ...)│───→│  Step 7: GPU-B 通过 SGT     │
+│      → SGT 包含 GPU-A 的    │    │  直接访问 GPU-A 的 VRAM     │
+│        PCIe BAR 地址         │    │    使用 P2P DMA 读/写数据   │
+│                              │    │                              │
+│  ┌──────── P2P 传输路径 ────────────────────────────────┐       │
+│  │  GPU-A VRAM ←→ PCIe Switch ←→ GPU-B               │       │
+│  │  （无需经过系统内存）                                 │       │
+│  └──────────────────────────────────────────────────────┘       │
+│                              │    │                              │
+│  P2P 不可用时的降级路径：    │    │                              │
+│    xe_bo_migrate(bo, TT)     │    │  导入者通过系统内存 DMA     │
+│    → BO 迁移到系统内存       │    │  访问数据                    │
+│    drm_prime_pages_to_sg()   │    │                              │
+│    dma_map_sgtable()         │    │                              │
+└──────────────────────────────┘    └──────────────────────────────┘
+```
+
+### 12.4 场景三：GPU-A ↔ GPU-B 双向 P2P 数据交换
+
+在实际的多 GPU 计算场景中，两个 GPU 之间需要双向交换数据（如分布式训练中的梯度同步）。整个过程的时序如下：
+
+```
+时间 ──────────────────────────────────────────────────→
+
+GPU-A                                GPU-B
+  │                                    │
+  │  ① 计算产生结果 R_A                │  ① 计算产生结果 R_B
+  │     （存储在 GPU-A VRAM）          │     （存储在 GPU-B VRAM）
+  │                                    │
+  │                                    │  ② GPU-B 需要读取 R_A
+  │                                    │     → 触发 page fault
+  │                                    │     → xe_svm_handle_pagefault()
+  │                                    │
+  │  ③ GPU-A 作为源端执行迁移          │
+  │     copy_to_ram():                 │
+  │     xe_svm_copy(TO_SRAM)           │
+  │     xe_migrate_from_vram()         │
+  │       ↓ P2P DMA                    │
+  │       └────────────────────────────→│  ④ 数据到达 GPU-B VRAM
+  │                                    │     page fault 处理完成
+  │                                    │     xe_vm_range_rebind()
+  │                                    │
+  │  ⑤ GPU-A 需要读取 R_B             │
+  │     → 触发 page fault              │
+  │     → xe_svm_handle_pagefault()    │
+  │                                    │
+  │                                    │  ⑥ GPU-B 作为源端执行迁移
+  │                                    │     copy_to_ram():
+  │                                    │     xe_svm_copy(TO_SRAM)
+  │                                    │     xe_migrate_from_vram()
+  │       ↓ P2P DMA                    │       │
+  │  ⑦ ←────────────────────────────────┘       │
+  │     数据到达 GPU-A VRAM            │
+  │     page fault 处理完成            │
+  │     xe_vm_range_rebind()           │
+  │                                    │
+  │  ⑧ 双方继续计算                    │  ⑧ 双方继续计算
+  │     使用本地 VRAM 数据              │     使用本地 VRAM 数据
+  │     （XE_INTERCONNECT_VRAM）       │     （XE_INTERCONNECT_VRAM）
+  ▼                                    ▼
+```
+
+### 12.5 迁移重试与竞争处理
+
+多 GPU 环境中的数据迁移可能面临竞争和失败，Xe 驱动实现了完善的重试机制：
+
+```c
+// xe_svm_handle_pagefault 中的重试逻辑
+int migrate_try_count = ctx.devmem_only ? 3 : 1;  // 最多 3 次重试
+
+// 重试策略：
+// 1. VRAM 分配失败 → 双倍 timeslice 后重试
+ctx.timeslice_ms <<= 1;
+
+// 2. -EBUSY → 提升锁级别（读锁→写锁），驱逐现有范围后重试
+if (err == -EBUSY && retries) {
+    up_read(&driver_migrate_lock);
+    down_write_killable(&driver_migrate_lock);  // 升级为写锁
+    drm_gpusvm_range_evict(range->base.gpusvm, &range->base);  // 驱逐
+}
+
+// 3. migrate_vma 竞争 → drm_pagemap_migrate_to_devmem 中检测
+if (migrated_pages < npages - own_pages) {
+    err = -EBUSY;  // 迁移过程中有其他操作修改了页面
+}
+
+// 4. 页面错误重试（-EAGAIN）→ 重新查找 VMA 后重试
+if (ret == -EAGAIN) {
+    vma = xe_vm_find_vma_by_addr(vm, fault_addr);
+    goto retry;
+}
+```
+
+### 12.6 Timeslice 机制
+
+`timeslice_ms` 参数防止迁移活锁——当页面在两个 GPU 之间反复迁移时：
+
+```c
+// 迁移完成后设置 timeslice 过期时间
+devmem_allocation->timeslice_expiration = get_jiffies_64() +
+    msecs_to_jiffies(mdetails->timeslice_ms);
+```
+
+在 `timeslice_expiration` 到期之前，页面不会被再次迁移到其他位置，确保 GPU 有足够的时间完成对数据的计算操作。Xe 驱动的默认值为 **5 毫秒**（`xe->atomic_svm_timeslice_ms = 5`，设置于 `xe_device.c`），可通过 debugfs 节点 `atomic_svm_timeslice_ms` 在运行时调整。每次迁移重试时，timeslice 会自动翻倍（`ctx.timeslice_ms <<= 1`），逐步增加驻留时间以降低活锁风险。
+
+### 12.7 多 GPU P2P 数据交换的完整函数调用栈
+
+以下是从 GPU 页面错误到 P2P DMA 传输完成的完整调用栈：
+
+```
+xe_svm_handle_pagefault(vm, vma, gt, fault_addr, atomic)
+ └→ __xe_svm_handle_pagefault(vm, vma, gt, fault_addr, need_vram)
+     ├→ xe_svm_garbage_collector(vm)
+     ├→ xe_svm_range_find_or_insert(vm, fault_addr, vma, &ctx)
+     ├→ xe_svm_alloc_vram(range, &ctx, dpagemap)
+     │   └→ drm_pagemap_populate_mm(dpagemap, start, end, mm, timeslice_ms)
+     │       └→ xe_drm_pagemap_populate_mm(dpagemap, start, end, mm, timeslice_ms)
+     │           ├→ xe_bo_create_locked(xe, ..., XE_BO_FLAG_VRAM)
+     │           ├→ drm_pagemap_devmem_init(&bo->devmem_allocation, ...)
+     │           └→ drm_pagemap_migrate_to_devmem(&bo->devmem_allocation, ...)
+     │               ├→ migrate_vma_setup(&migrate)
+     │               ├→ ops->populate_devmem_pfn()  →  xe_svm_populate_devmem_pfn()
+     │               ├→ drm_pagemap_migrate_range()
+     │               │   ├→ dpagemap->ops->device_map()  →  xe_drm_pagemap_device_map()
+     │               │   │   └→ dma_map_resource(dev, xe_page_to_pcie(page), ...)
+     │               │   │   └→ prot = XE_INTERCONNECT_P2P
+     │               │   └→ ops->copy_to_ram()  →  xe_svm_copy_to_ram()
+     │               │       └→ xe_svm_copy(pages, pagemap_addr, npages, TO_SRAM, ...)
+     │               │           └→ xe_migrate_from_vram(migrate, npages, vram_addr, ...)
+     │               │               └→ GPU DMA 引擎: VRAM(src) → PCIe P2P → VRAM(dst)
+     │               ├→ migrate_vma_pages(&migrate)
+     │               └→ migrate_vma_finalize(&migrate)
+     ├→ xe_svm_range_get_pages(vm, range, &ctx)
+     │   └→ xe_drm_pagemap_device_map()  →  prot = XE_INTERCONNECT_VRAM（同设备）
+     ├→ xe_vm_range_rebind(vm, vma, range, BIT(tile->id))
+     └→ dma_fence_wait(fence, false)
+```
+
+---
+
+## 13. 配置依赖与编译选项
+
+### 13.1 内核配置
 
 | 配置选项 | 说明 | P2P 影响 |
 |----------|------|----------|
@@ -698,7 +1083,7 @@ xe_migrate_to_vram() / xe_migrate_from_vram()
 | `CONFIG_ZONE_DEVICE` | 设备内存区域 | `drm_pagemap` 框架所需 |
 | `CONFIG_DRM_XE_KUNIT_TEST` | Xe KUnit 测试 | P2P 测试所需 |
 
-### 12.2 运行时检测
+### 13.2 运行时检测
 
 P2P 支持完全在运行时动态检测，不需要额外的模块参数或编译时开关：
 - `pci_p2pdma_distance()` 根据实际 PCIe 拓扑返回结果。
@@ -707,9 +1092,9 @@ P2P 支持完全在运行时动态检测，不需要额外的模块参数或编�
 
 ---
 
-## 13. 总结与设计亮点
+## 14. 总结与设计亮点
 
-### 13.1 架构设计亮点
+### 14.1 架构设计亮点
 
 1. **协议抽象（Interconnect Protocol）**：通过 `drm_pagemap_addr.proto` 字段统一编码不同的访问路径，使上层代码无需关心具体的地址类型。
 
@@ -723,7 +1108,7 @@ P2P 支持完全在运行时动态检测，不需要额外的模块参数或编�
 
 6. **异步生命周期管理**：`xe_pagemap_destroy` 支持从原子/回收上下文调用，通过工作队列延迟实际销毁，避免在关键路径中执行耗时的清理操作。
 
-### 13.2 P2P 在 Xe 驱动中的核心价值
+### 14.2 P2P 在 Xe 驱动中的核心价值
 
 | 应用场景 | 无 P2P | 有 P2P |
 |----------|--------|--------|
@@ -733,7 +1118,7 @@ P2P 支持完全在运行时动态检测，不需要额外的模块参数或编�
 | 内存带宽消耗 | 系统内存带宽成为瓶颈 | 减少系统内存带宽压力 |
 | 延迟 | 额外的 CPU 拷贝延迟 | 最小化传输延迟 |
 
-### 13.3 代码组织总结
+### 14.3 代码组织总结
 
 Xe 驱动的 P2P 实现没有独立的 P2P 模块文件，而是有机地分布在三个层次中：
 
